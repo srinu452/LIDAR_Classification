@@ -1,0 +1,38 @@
+# =============================
+# README
+# =============================
+# This repository-style single file contains ALL code blocks you can paste into
+# separate files. The pipeline trains a point-level classifier to label
+#   Class 0 = Other (default)
+#   Class 1 = Powerline
+#   Class 2 = Pole
+# on raw .laz tiles and writes predictions back to .laz.
+#
+# Files included below (search for the headers and split them into files):
+#  1) requirements.txt
+#  2) config.yaml
+#  3) preprocess_laz.py       -- Convert .laz → feature .npy (and labels if present)
+#  4) dataset.py              -- PyTorch dataset with block sampling & balancing
+#  5) models/pointnet.py      -- Compact PointNet classifier (fast & reliable)
+#  6) train.py                -- Train loop with weights, logging, checkpoints
+#  7) infer_write_laz.py      -- Predict full tile & write classifications to .laz
+#  8) utils/geometry.py       -- kNN normals, grid ground, FPS sampling
+#  9) utils/io.py             -- Safe save/load helpers
+# 10) utils/blocks.py         -- Slide/chunk a big tile for inference
+#
+# Usage (example):
+#   python preprocess_laz.py --in_glob data/raw/*.laz --out_dir data/npz --map_from_existing_labels
+#   python train.py --data_root data/npz --epochs 50
+#   python infer_write_laz.py --model_ckpt runs/best.pt --in_laz data/raw/tile01.laz --out_laz data/pred/tile01_pred.laz
+#
+# Notes:
+# - If your source tiles already contain LAS classification codes, set
+#   --map_from_existing_labels in preprocessing (mapping table below). Otherwise
+#   you can annotate a few tiles and re-run preprocessing.
+# - PointNet is used for brevity and robustness. You can swap in a PointNet++
+#   implementation later; dataset & training code remain identical.
+# - Everything is CPU/GPU agnostic; it will use CUDA if available.
+
+
+
+# =====================================

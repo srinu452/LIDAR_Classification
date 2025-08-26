@@ -1,0 +1,11 @@
+#  2) config.yaml
+# =====================================
+data_root: data/npz
+num_classes: 3            # 0 other, 1 line, 2 pole
+batch_size: 8
+points_per_block: 4096
+lr: 0.001
+epochs: 50
+class_weights: [1.0, 20.0, 10.0]   # tune per your imbalance
+num_workers: 4
+log_dir: runs
