@@ -1,38 +1,555 @@
-# =============================
-# README
-# =============================
-# This repository-style single file contains ALL code blocks you can paste into
-# separate files. The pipeline trains a point-level classifier to label
-#   Class 0 = Other (default)
-#   Class 1 = Powerline
-#   Class 2 = Pole
-# on raw .laz tiles and writes predictions back to .laz.
-#
-# Files included below (search for the headers and split them into files):
-#  1) requirements.txt
-#  2) config.yaml
-#  3) preprocess_laz.py       -- Convert .laz → feature .npy (and labels if present)
-#  4) dataset.py              -- PyTorch dataset with block sampling & balancing
-#  5) models/pointnet.py      -- Compact PointNet classifier (fast & reliable)
-#  6) train.py                -- Train loop with weights, logging, checkpoints
-#  7) infer_write_laz.py      -- Predict full tile & write classifications to .laz
-#  8) utils/geometry.py       -- kNN normals, grid ground, FPS sampling
-#  9) utils/io.py             -- Safe save/load helpers
-# 10) utils/blocks.py         -- Slide/chunk a big tile for inference
-#
-# Usage (example):
-#   python preprocess_laz.py --in_glob data/raw/*.laz --out_dir data/npz --map_from_existing_labels
-#   python train.py --data_root data/npz --epochs 50
-#   python infer_write_laz.py --model_ckpt runs/best.pt --in_laz data/raw/tile01.laz --out_laz data/pred/tile01_pred.laz
-#
-# Notes:
-# - If your source tiles already contain LAS classification codes, set
-#   --map_from_existing_labels in preprocessing (mapping table below). Otherwise
-#   you can annotate a few tiles and re-run preprocessing.
-# - PointNet is used for brevity and robustness. You can swap in a PointNet++
-#   implementation later; dataset & training code remain identical.
-# - Everything is CPU/GPU agnostic; it will use CUDA if available.
+# LiDAR Powerline & Pole-focused Classification Pipeline
+
+> Complete end-to-end pipeline (code + explanations + README) to prioritize powerline and pole detection and classification from .las/.laz LiDAR point clouds. Includes data preprocessing, feature extraction, PointNet++ model for per-point segmentation, training, inference, model export (TorchScript/ONNX), and deployment skeleton.
+
+---
+
+## TL;DR
+
+* **Goal:** Build a robust pipeline that classifies LiDAR points with special emphasis (higher recall & precision) on **powerlines** and **poles** while also labeling common classes (ground, vegetation, building, water, other).
+* **Model:** PointNet++ (per-point semantic segmentation) — good balance of accuracy and engineering complexity. Alternatives noted.
+* **Files included:** README, environment, preprocessing scripts, feature extraction, dataset/patching, model code, train/infer scripts, postprocessing for poles/powerlines, model export & deployment skeleton.
+
+---
+
+## Table of Contents
+
+1. Overview & motivation
+2. Dataset & labeling schema
+3. Directory structure
+4. Environment & dependencies
+5. Preprocessing (ground normalization, tiling, sampling)
+6. Feature extraction
+7. Dataset + DataLoader
+8. Model (PointNet++)
+9. Training script (with class weighting to prioritize powerline/pole)
+10. Inference & raster/las output
+11. Post-processing: pole detection and vectorization of powerlines
+12. Model export and deployment (TorchScript / ONNX / FastAPI skeleton)
+13. Evaluation & metrics
+14. Tips to improve performance
+15. Appendix: code reference and commands
+
+---
+
+## 1. Overview & motivation
+
+Powerlines and poles are thin, often sparsely-sampled features in airborne LiDAR. This pipeline focuses on increasing detection quality by:
+
+* Using **per-point segmentation** (PointNet++) that models local geometry.
+* **Feature engineering** emphasizing vertical structure (height, normals, eigen-features, local linearity) and intensity/return properties.
+* **Data balancing & loss weighting** to recover rare classes.
+* **Postprocessing** to convert classified points into pole points and polyline powerline vectors (useful for mapping and downstream GIS applications).
+
+Key challenge: thin structures often have few returns; careful tiling, oversampling, and strong local features help.
+
+---
+
+## 2. Dataset & labeling schema
+
+Recommended per-point class indices (LAS classification-style custom mapping):
+
+| ID | Class name        |
+| -- | ----------------- |
+| 0  | Unlabeled/Unknown |
+| 1  | Ground            |
+| 2  | Vegetation        |
+| 3  | Building          |
+| 4  | Pole              |
+| 5  | Powerline         |
+| 6  | Water             |
+| 7  | Other / Manmade   |
+
+**Labeling tips**
+
+* Use CloudCompare / Potree / LAStools for manual corrections.
+* For powerlines: label the points on the wire itself (they are often sparse). Consider expanding the label to adjacent returns (1–2 m) to capture weak points.
+* For poles: label vertical clusters of returns from top to ground. Poles often have high vertical linearity and small footprint.
+
+---
+
+## 3. Directory structure (recommended)
+
+```
+lidar_powerline_pipeline/
+├── README.md
+├── environment.yml
+├── requirements.txt
+├── data/
+│   ├── raw/              # original .las/.laz
+│   ├── dtm/              # DTM/ground tiles (if produced)
+│   ├── tiles/            # tiled raw points
+│   └── processed/        # .npz patches (points + features + labels)
+├── notebooks/
+├── scripts/
+│   ├── preprocess.py
+│   ├── make_patches.py
+│   ├── extract_features.py
+│   ├── train.py
+│   ├── infer.py
+│   └── export_model.py
+├── src/
+│   ├── datasets.py
+│   ├── utils.py
+│   └── models/
+│       └── pointnet2_seg.py
+├── models/               # saved checkpoints
+└── deploy/
+    └── fastapi_app.py
+```
+
+---
+
+## 4. Environment & dependencies
+
+**Python version:** 3.9 or 3.10 recommended.
+
+**Conda + pip (recommended)**
+
+```bash
+conda create -n lidar-pwr python=3.10 -y
+conda activate lidar-pwr
+# PDAL via conda-forge (recommended for ground filtering)
+conda install -c conda-forge pdal python-pdal -y
+# core python deps
+pip install laspy numpy pandas scipy scikit-learn matplotlib open3d torch torchvision tqdm numba shapely rtree
+```
+
+**requirements.txt (minimal)**
+
+```
+laspy
+numpy
+pandas
+scipy
+scikit-learn
+open3d
+torch
+torchvision
+tqdm
+numba
+pdal
+shapely
+rtree
+matplotlib
+```
+
+Notes:
+
+* PDAL is recommended for robust ground classification and filtering (use conda install -c conda-forge pdal).
+* Open3D is optional but handy for normals and visualization.
+
+---
+
+## 5. Preprocessing
+
+High-level steps:
+
+1. **Ground classification / DTM generation** (PDAL recommended)
+2. **Height normalization** (z\_rel = z - ground\_elevation)
+3. **Tile the point cloud** into fixed-size tiles with overlap
+4. **Sample / balance points per tile** (N points per patch)
+
+### 5.1 Ground classification (PDAL example)
+
+Save this pipeline JSON as `pdal_ground.json` and run `pdal pipeline pdal_ground.json`.
+
+```json
+{
+  "pipeline": [
+    "input.laz",
+    {"type": "filters.reprojection", "out_srs": "EPSG:32643"},
+    {"type": "filters.smrf", "slope": 0.15, "window": 16.0, "threshold": 0.5, "scalar": 1.25},
+    {"type": "filters.range", "limits": "Classification[2:2]"},
+    {"type": "writers.las", "filename": "ground.laz"}
+  ]
+}
+```
+
+**Explanation:** `filters.smrf` segments ground. Tune `slope`, `window`, and `threshold` to your terrain.
+
+### 5.2 Height normalization
+
+* Build a DTM from ground points (grid interpolation) and subtract it from each point's z to get relative height (use bilinear interpolation).
+
+**Sample code snippet (height normalization)**
+
+```python
+# scripts/preprocess.py (excerpt)
+import laspy
+import numpy as np
+from scipy.interpolate import griddata
+
+las = laspy.read('data/raw/scan.laz')
+x,y,z = las.x, las.y, las.z
+# Suppose ground_points is a subset labeled as ground
+# Build grid
+grid_x, grid_y = np.mgrid[x.min():x.max():500j, y.min():y.max():500j]
+# Interpolate ground elevation
+ground_points = ... # load ground-classified points
+grid_z = griddata((ground_points.x, ground_points.y), ground_points.z, (grid_x, grid_y), method='linear')
+# For each point, bilinear interp of grid_z to compute ground_z
+# z_rel = z - ground_z_at_xy
+```
+
+### 5.3 Tiling & sampling (make\_patches.py)
+
+* Tile in XY (tile size e.g., 20 m) with overlap 2–5 m.
+* For each tile, sample `N = 4096` points using either uniform sampling or importance sampling (oversample powerline/pole points).
+* Save patches as `.npz` with `points (N x 3)`, `features (N x F)`, `labels (N)`.
+
+**Sampling strategy to emphasize powerlines/poles**
+
+* If a tile contains powerline/pole points, oversample them to represent at least `p%` of the patch (e.g., min 10% of samples) so the model sees more of the rare class.
+
+---
+
+## 6. Feature extraction
+
+Per-point features that help detect thin vertical structures:
+
+* `x, y, z_rel` (z relative to ground)
+* `intensity`
+* `return_number`, `num_returns`
+* **Local eigen-features**: compute PCA on k-nearest neighbors to get eigenvalues λ1 ≥ λ2 ≥ λ3.
+
+  * Linear feature = (λ1 - λ2) / λ1  (high for line-like structures)
+  * Planarity = (λ2 - λ3) / λ1
+  * Sphericity = λ3 / λ1
+* **Normals** (nx, ny, nz)
+* **Local density** (#points in radius r)
+* **Height above ground** (z\_rel)
+
+**Core code (extract\_features.py excerpt)**
+
+```python
+# scripts/extract_features.py
+import numpy as np
+from scipy.spatial import cKDTree
+
+def compute_eig_feats(points, k=16):
+    tree = cKDTree(points[:, :3])
+    eig_feats = np.zeros((points.shape[0], 3))
+    for i, p in enumerate(points[:, :3]):
+        dists, idx = tree.query(p, k=k)
+        nbr = points[idx, :3]
+        cov = np.cov((nbr - nbr.mean(axis=0)).T)
+        w, v = np.linalg.eig(cov)
+        w = np.sort(np.abs(w))[::-1] + 1e-12
+        l1, l2, l3 = w
+        linearity = (l1 - l2) / l1
+        planarity = (l2 - l3) / l1
+        sphericity = l3 / l1
+        eig_feats[i] = [linearity, planarity, sphericity]
+    return eig_feats
+```
+
+Note: For large point clouds, parallelize or use numba / C++ accelerated libraries.
+
+---
+
+## 7. Dataset & DataLoader (PyTorch)
+
+**File:** `src/datasets.py`
+
+* Loads `.npz` patches (points, features, labels)
+* Data augmentation: random rotation around Z, jittering, point dropout
+* Return `N x (3 + F)` tensor and labels `N`
+
+**Key design to prioritize rare classes:**
+
+* Patch sampling probability weighted higher for tiles containing powerlines/poles.
+* On-the-fly augmentation to create variations.
+
+---
+
+## 8. Model: PointNet++ segmentation
+
+**Why PointNet++?**
+
+* Models local neighborhoods hierarchical (Set abstraction) — good for capturing line-like and small structures like poles and wires.
+* Easier to implement and adapt than some state-of-the-art networks; good accuracy for per-point segmentation.
+
+**Files:** `src/models/pointnet2_seg.py` (a compact PointNet++ implementation). The file contains:
+
+* `PointNetSetAbstraction` (sampling + grouping + MLP)
+* `PointNetFeaturePropagation`
+* `PointNet2Seg` final model outputting per-point logits for C classes.
+
+*(The full implementation is included in the canvas code block ****`src/models/pointnet2_seg.py`****.)*
+
+---
+
+## 9. Training script
+
+**File:** `scripts/train.py` — key points
+
+* Loss: `nn.CrossEntropyLoss(weight=class_weights)` where class\_weights assign higher weight to `Pole` (id=4) and `Powerline` (id=5). Example: `weights = [1.0,1.0,1.0,1.0,5.0,5.0,1.0,1.0]` (tune via validation)
+* Optimizer: `AdamW` with LR scheduler
+* Save best checkpoint by validation mean IoU (esp pay attention to IoU for classes 4 & 5)
+* Mixed precision option (if GPU) for training faster
+
+**Training loop pseudocode**
+
+```python
+for epoch in range(epochs):
+    model.train()
+    for batch in train_loader:
+        points, feats, labels = batch
+        logits = model(points, feats)
+        loss = criterion(logits, labels)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+    # validate: compute per-class IoU and save best
+```
+
+---
+
+## 10. Inference & writing a classified LAZ
+
+**File:** `scripts/infer.py`
+
+* Load full tile LAS
+* Compute features (same pipeline)
+* Tile & create overlapping patches (same as training)
+* Run model on patches, produce per-point class probabilities
+* Aggregate overlapping patch results by averaging probabilities
+* Assign class = argmax(prob)
+* Write back to LAS/LAZ using `laspy` (set `las.classification` or custom point attribute)
+
+**Write classified LAS (laspy)**
+
+```python
+import laspy
+las = laspy.read('tile.laz')
+las.classification = predicted_labels.astype(np.uint8)
+las.write('tile_classified.laz')
+```
+
+---
+11 — Post-processing: pole detection and vectorization of powerlines
+
+Pole detection (postprocess):
+
+After per-point predictions, extract points with class 10 (pole).
+
+Run DBSCAN or hierarchical clustering (small radius, e.g., 0.5 m) to group pole points.
+
+For each cluster compute centroid (pole base) and pole height (max Z). Output CSV or GeoJSON.
+
+Example src/postprocess.py (pole extraction)
+
+# src/postprocess.py
+import numpy as np
+from sklearn.cluster import DBSCAN
+import laspy, json
+
+def extract_poles(las_path, out_geojson, eps=0.5, min_samples=6):
+    las = laspy.read(las_path)
+    xyz = np.vstack((las.x, las.y, las.z)).T
+    cls = las.classification
+    pole_inds = np.where(cls==10)[0]
+    if len(pole_inds)==0:
+        print("No pole points found")
+        return
+    pts = xyz[pole_inds]
+    db = DBSCAN(eps=eps, min_samples=min_samples).fit(pts[:,:2])
+    labels = db.labels_
+    features = []
+    for lab in np.unique(labels):
+        if lab==-1: continue
+        mask = labels==lab
+        cluster = pts[mask]
+        lon = cluster[:,0].mean()
+        lat = cluster[:,1].mean()
+        height = cluster[:,2].max()
+        features.append({
+            "type":"Feature",
+            "properties":{"height":float(height), "points":int(cluster.shape[0])},
+            "geometry":{"type":"Point","coordinates":[float(lon), float(lat)]}
+        })
+    geo = {"type":"FeatureCollection", "features": features}
+    with open(out_geojson,'w') as f:
+        json.dump(geo,f, indent=2)
+    print("Saved poles to", out_geojson)
 
 
+Powerline vectorization:
 
-# =====================================
+Extract points with class 11.
+
+Use 3D RANSAC line/curve fitting on sliding windows or apply a graph-building algorithm:
+
+Project wire points to XY plane
+
+Use connected components with a smaller distance threshold (0.5–1 m) to get wire segments
+
+For each segment apply RANSAC to fit 2D polylines or use minimal spanning tree and path smoothing
+
+Output polylines as GeoJSON or Shapefile.
+
+Simplified powerline linking (conceptual):
+
+# high level steps (implement in src/postprocess.py)
+- extract wire points (cls==11)
+- build KDTree; connect points that are within 0.8m and have similar Z (optional)
+- build graph edges and find connected components
+- for each component sort points along principal axis (PCA) and sample to generate polyline
+- save as GeoJSON LineString
+
+
+I can provide a full script on demand — it’s somewhat long but straightforward.
+
+12 — Model export and deployment (TorchScript / ONNX / FastAPI skeleton)
+
+Export TorchScript (trace):
+
+# src/export.py
+import torch
+from models.pointnet2 import SimplePointNet2
+import numpy as np
+
+def export_torchscript(model_path, out_ts, npoints=4096):
+    device='cpu'
+    model = SimplePointNet2(num_classes=12)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+    # create dummy inputs
+    pts = torch.randn(1, npoints, 3)
+    extras = torch.randn(1, npoints, 2)
+    traced = torch.jit.trace(model, (pts, extras))
+    traced.save(out_ts)
+    print("Saved TorchScript:", out_ts)
+
+def export_onnx(model_path, out_onnx, npoints=4096):
+    model = SimplePointNet2(num_classes=12)
+    model.load_state_dict(torch.load(model_path, map_location='cpu'))
+    model.eval()
+    dummy_pts = torch.randn(1, npoints, 3)
+    dummy_extras = torch.randn(1, npoints, 2)
+    torch.onnx.export(model, (dummy_pts, dummy_extras), out_onnx,
+                      input_names=['pts','extras'], output_names=['logits'],
+                      dynamic_axes={'pts':{1:'N'}, 'extras':{1:'N'}, 'logits':{1:'N'}})
+    print("Saved ONNX:", out_onnx)
+
+
+FastAPI skeleton src/serve.py — minimal upload endpoint returning GeoJSON with poles + powerlines (runs inference using TorchScript model for speed):
+
+# src/serve.py
+from fastapi import FastAPI, UploadFile, File
+import tempfile, laspy, numpy as np, json
+import torch
+from src.export import SimplePointNet2  # if torchscript, load differently
+
+app = FastAPI()
+# If you exported TorchScript:
+TS_MODEL_PATH = "models/pointnet2_ts.pt"
+model = torch.jit.load(TS_MODEL_PATH)
+model.eval()
+
+@app.post("/predict-las/")
+async def predict(file: UploadFile = File(...)):
+    tmp = tempfile.NamedTemporaryFile(delete=False)
+    tmp.write(await file.read())
+    tmp.flush()
+    las = laspy.read(tmp.name)
+    xyz = np.vstack((las.x, las.y, las.z)).T
+    intensity = las.intensity if 'intensity' in las.point_format.dimension_names else np.zeros(len(xyz))
+    # run inference using same tiling/chunk logic (call infer_pointnet from src/infer.py)
+    # after writing a temporary CLASSIFIED las, run postprocessors to extract poles and polylines and return
+    return {"status":"ok", "message": "prediction initiated"}
+
+
+Containerize with Dockerfile (as shown earlier). Use GPUs by basing on nvidia/cuda images and installing proper torch.
+
+13 — Evaluation & metrics
+
+Compute per-class metrics focusing on classes 10 and 11:
+
+Precision, Recall, F1 (per-class)
+
+IoU (Intersection over Union) per class
+
+Confusion matrix (to see confusion between powerline & noise or pole & vegetation)
+
+Example evaluation snippet:
+
+from sklearn.metrics import classification_report, confusion_matrix
+y_true = ...    # vectorized
+y_pred = ...
+print(classification_report(y_true, y_pred, labels=[10,11], target_names=['pole','powerline']))
+
+
+For poles, evaluate detection as object detection:
+
+IoU of clusters (if you have ground truth pole centroids), or distance between predicted centroid and GT centroid (mean error).
+
+14 — Tips to improve performance (practical)
+
+Data quality: denser LiDAR + good labeling is best. Thin wires need high point density.
+
+Neighborhood scale: use small radii (0.2–0.5m) for wire detection.
+
+Loss engineering: use focal loss or higher class weights for 10 and 11.
+
+Ensemble: combine RF (handcrafted features) with PointNet++ predictions (vote for final label).
+
+Postprocessing: apply graph-based linking and RANSAC filtering on wire predictions to clean false positives.
+
+Augmentations: rotation about z, jitter, small vertical scaling; synthetic wires injected for augmentation.
+
+Use hierarchical PointNet++: captures local features at multiple scales — helps thin structure detection.
+
+Multi-modal: fuse RGB/orthophoto where available — wires are visible in imagery.
+
+Test-time augmentation (TTA): rotate tile and average softmax outputs.
+
+Active learning: present low-confidence predictions to labelers to improve dataset iteratively.
+
+15 — Appendix: code reference and commands (one-by-one)
+
+Create venv & install
+
+python -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+
+
+Preprocess raw LAS into tiles
+
+python src/preprocess.py --input data/raw/site1.laz --out data/tiles --tile-size 20 --overlap 2 --grid 1.0
+
+
+Train PointNet++ (simplified)
+
+python src/train_pointnet.py --data data/tiles --out models/ --epochs 60 --batch 8 --npoints 4096
+
+
+Run inference
+
+python src/infer.py --model models/pointnet2_final.pt --input data/raw/site1.las --out outputs/site1_classified.las --device cuda
+
+
+Extract poles
+
+python -c "from src.postprocess import extract_poles; extract_poles('outputs/site1_classified.las','outputs/site1_poles.geojson')"
+
+
+Export TorchScript
+
+python -c "from src.export import export_torchscript; export_torchscript('models/pointnet2_final.pt','models/pointnet2_ts.pt', npoints=4096)"
+
+
+Run FastAPI server (CPU)
+
+uvicorn src.serve:app --host 0.0.0.0 --port 8000
+
+
+Docker build (if Dockerfile present)
+
+docker build -t lidar-powerline-service .
+docker run -p 8000:8000 lidar-powerline-service
+
+Af
