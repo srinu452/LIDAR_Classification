@@ -1,4 +1,4 @@
-# LiDAR Powerline & Pole-focused Classification Pipeline
+## LiDAR Powerline & Pole-focused Classification Pipeline
 
 > Complete end-to-end pipeline (code + explanations + README) to prioritize powerline and pole detection and classification from .las/.laz LiDAR point clouds. Includes data preprocessing, feature extraction, PointNet++ model for per-point segmentation, training, inference, model export (TorchScript/ONNX), and deployment skeleton.
 
@@ -553,3 +553,4 @@ docker build -t lidar-powerline-service .
 docker run -p 8000:8000 lidar-powerline-service
 
 Af
+
