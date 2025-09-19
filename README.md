@@ -554,5 +554,10 @@ docker run -p 8000:8000 lidar-powerline-service
 
 Af
 
+<h1>Input<img width="919" height="369" alt="p2" src="https://github.com/user-attachments/assets/40b5db4f-cad5-4461-86da-c2ae3822835c" /></h1>
+<h1></h1><img width="1042" height="553" alt="p1" src="https://github.com/user-attachments/assets/65b74d8c-4f59-4724-984a-92b4fb0706ce" /></h1>
+
+
+
 
 
